@@ -85,28 +85,52 @@ class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
+        self.weight = nn.Parameter(torch.ones(dim))  # 创建一个可训练的参数，维度为dim，初始值为1
 
     def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        # mean：对 x^2 的最后一个维度的值求均值，保持张量维度；再加上eps
+        # rsqrt：求平方根的倒数
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) 
+
 
     def forward(self, x):
-        return self.weight * self._norm(x.float()).type_as(x)
+        # float()：转为float类型
+        # type_as(x)：将张量转换为与x相同的数据类型
+        return self.weight * self._norm(x.float()).type_as(x) 
 
 
+# 计算旋转位置编码的余弦和正弦矩阵
 def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), theta: float = 1e6):
+    # 生成不同维度的角频率（基础频率）
+    # 公式：1 / (theta ** (2i / dim))
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    # 生成不同位置的索引
     t = torch.arange(end, device=freqs.device)
+    # 生成不同位置的索引，与基础频率进行外积
+    # 公式：t * freqs
     freqs = torch.outer(t, freqs).float()
+    # 生成形状为 [end, dim] 的余弦和正弦矩阵，用于后续向量旋转
+    # cat(): 在指定维度上拼接张量
     freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1)
     freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1)
     return freqs_cos, freqs_sin
 
-
+# 应用旋转位置编码
+# 二维旋转矩阵是[[cos, -sin], [sin, cos]]，对于向量[a, b]，旋转后为[cos*a-sin*b, sin*a+cos*b]
+# 然后把a和b有关的部分提取出来，得到[cos*a, sin*a]和[cos*b, -sin*b]
+# 将向量[a, b]视为复数a+ib，旋转θ即为两者相乘(a​+ib​)(cosθ​+isinθ​)=(cos*a-sin*b)+i(sin*a+cos*b)
+# 同类项合并可得 a=cos*a-sin*b, b=sin*a+cos*b
+# 而，与二维旋转矩阵相同
+# 所以可以将二维旋转矩阵视为复数旋转矩阵，复数旋转矩阵的旋转操作相当于交换实部虚部并取反虚部
+# 位置信息蕴含在旋转角度中
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    # 将输入向量的后一半维度取负，并与前一半维度拼接，实现向量旋转
     def rotate_half(x):
+        # 因为q和k的形状通常是[batch, num_heads, seq_len, head_dim]，
+        # head_dim 是单个注意力头的特征维度，所以要对最后一维进行旋转，对前三维旋转没有意义
+        # [...,num:]等价于[:,:,:,num:]
         return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim=-1)
-
+    # 通过复数乘法实现向量旋转
     q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim))
     k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))
     return q_embed, k_embed
@@ -114,6 +138,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
+    # 将输入张量的dim_2维重复n_rep次，实现向量重复，是注释方法的高效替代实现
     bs, slen, num_key_value_heads, head_dim = x.shape
     if n_rep == 1:
         return x
@@ -131,7 +156,7 @@ class Attention(nn.Module):
         assert args.num_attention_heads % self.num_key_value_heads == 0
         self.n_local_heads = args.num_attention_heads
         self.n_local_kv_heads = self.num_key_value_heads
-        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads # q头数与k,v头数的比例
         self.head_dim = args.hidden_size // args.num_attention_heads
         self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
@@ -156,30 +181,42 @@ class Attention(nn.Module):
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
 
         cos, sin = position_embeddings
-        xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
+        xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len]) # 动态匹配对应长度的位置编码
 
         # kv_cache实现
         if past_key_value is not None:
-            xk = torch.cat([past_key_value[0], xk], dim=1)
+            xk = torch.cat([past_key_value[0], xk], dim=1) # dim=1 是因为dim_1是seq_len维度，需要按照seq_len维度拼接
             xv = torch.cat([past_key_value[1], xv], dim=1)
-        past_kv = (xk, xv) if use_cache else None
+        past_kv = (xk, xv) if use_cache else None # 根据use_cache参数决定是否保存past_kv
 
+        # k,v头数与查询头数相等
         xq, xk, xv = (
-            xq.transpose(1, 2),
-            repeat_kv(xk, self.n_rep).transpose(1, 2),
+            # 多头注意力计算公式要求 头维度（num_heads） 位于序列长度维度（seq_len）之前，以便并行计算多个头的注意力分数。
+            xq.transpose(1, 2), # (batch_size, seq_len, num_heads, head_dim) -> (batch_size, num_heads, seq_len, head_dim)
+            # 扩展k,v头数，使之与q头数匹配
+            repeat_kv(xk, self.n_rep).transpose(1, 2), 
             repeat_kv(xv, self.n_rep).transpose(1, 2)
         )
-
+        # 使用flash attention
         if self.flash and seq_len != 1:
+            # 训练时使用dropout防止过拟合
             dropout_p = self.dropout if self.training else 0.0
             attn_mask = None
+            # 使用掩码
             if attention_mask is not None:
+                # 将注意力掩码扩展到多头注意力分数矩阵的维度 
+                # (bsz, seq) -> (bsz, 1, 1, seq)->(bsz, n_local_heads, seq_len, seq_len)
                 attn_mask = attention_mask.view(bsz, 1, 1, -1).expand(bsz, self.n_local_heads, seq_len, -1)
+                # 将注意力掩码转换为布尔类型，以便在后续的缩放点积注意力计算中使用
                 attn_mask = attn_mask.bool() if attention_mask is not None else None
-
+            # QK^T/sqrt(d_k),加了缩放因子sqrt(d_k)的注意力就是缩放点积注意力。
+            # 该方法是pytorch2.0中的官方实现，is_causal=True表示使用因果掩码，在分数的上三角部分设置为-inf
             output = F.scaled_dot_product_attention(xq, xk, xv, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=True)
-        else:
+        else: # 手动实现注意力分数 QK^T/sqrt(d_k)
+            # @ 规定乘以最后两个维度，即矩阵乘法，前面的维度当做批次，进行并行计算
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            # 进行mask
+            # triu() 取输入矩阵的上三角部分，diagonal=1 从主对角线(左上->右下)往上一斜线开始保留矩阵元素
             scores = scores + torch.triu(
                 torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
                 diagonal=1
