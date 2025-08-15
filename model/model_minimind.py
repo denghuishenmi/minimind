@@ -154,8 +154,8 @@ class Attention(nn.Module):
         super().__init__()
         self.num_key_value_heads = args.num_attention_heads if args.num_key_value_heads is None else args.num_key_value_heads
         assert args.num_attention_heads % self.num_key_value_heads == 0
-        self.n_local_heads = args.num_attention_heads
-        self.n_local_kv_heads = self.num_key_value_heads
+        self.n_local_heads = args.num_attention_heads # 查询头数
+        self.n_local_kv_heads = self.num_key_value_heads # KV 头数
         self.n_rep = self.n_local_heads // self.n_local_kv_heads # q头数与k,v头数的比例
         self.head_dim = args.hidden_size // args.num_attention_heads
         self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False)
@@ -174,7 +174,8 @@ class Attention(nn.Module):
                 past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                 use_cache=False,
                 attention_mask: Optional[torch.Tensor] = None):
-        bsz, seq_len, _ = x.shape
+        # x: (bsz, seq_len, hidden_size)
+        bsz, seq_len, _ = x.shape 
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
@@ -184,6 +185,7 @@ class Attention(nn.Module):
         xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len]) # 动态匹配对应长度的位置编码
 
         # kv_cache实现
+        # 在这里如果使用kv cache的话，xk和xv的seq_len长度就会是当前seq_len+last_seq_len，后面手动实现sdpa时scores的计算会出问题
         if past_key_value is not None:
             xk = torch.cat([past_key_value[0], xk], dim=1) # dim=1 是因为dim_1是seq_len维度，需要按照seq_len维度拼接
             xv = torch.cat([past_key_value[1], xv], dim=1)
@@ -191,9 +193,11 @@ class Attention(nn.Module):
 
         # k,v头数与查询头数相等
         xq, xk, xv = (
-            # 多头注意力计算公式要求 头维度（num_heads） 位于序列长度维度（seq_len）之前，以便并行计算多个头的注意力分数。
-            xq.transpose(1, 2), # (batch_size, seq_len, num_heads, head_dim) -> (batch_size, num_heads, seq_len, head_dim)
+            # 多头注意力计算公式要求头维度 (num_heads) 位于序列长度维度 (seq_len) 之前，以便并行计算多个头的注意力分数。
+            # (batch_size, seq_len, n_local_heads, head_dim) -> (batch_size, n_local_heads, seq_len, head_dim)
+            xq.transpose(1, 2), 
             # 扩展k,v头数，使之与q头数匹配
+            # (batch_size, seq_len, n_local_kv_heads, head_dim) -> (batch_size, n_local_kv_heads, seq_len, head_dim)
             repeat_kv(xk, self.n_rep).transpose(1, 2), 
             repeat_kv(xv, self.n_rep).transpose(1, 2)
         )
@@ -202,37 +206,44 @@ class Attention(nn.Module):
             # 训练时使用dropout防止过拟合
             dropout_p = self.dropout if self.training else 0.0
             attn_mask = None
-            # 使用掩码
+            # 使用填充掩码
             if attention_mask is not None:
                 # 将注意力掩码扩展到多头注意力分数矩阵的维度 
-                # (bsz, seq) -> (bsz, 1, 1, seq)->(bsz, n_local_heads, seq_len, seq_len)
+                # seq_len就是current_seq_len，last_seq_len是kv cache的长度，若没有就是0
+                # (bsz, seq) -> (bsz, 1, 1, seq) -> (bsz, n_local_heads, current_seq_len, current_seq_len+last_seq_len)
                 attn_mask = attention_mask.view(bsz, 1, 1, -1).expand(bsz, self.n_local_heads, seq_len, -1)
                 # 将注意力掩码转换为布尔类型，以便在后续的缩放点积注意力计算中使用
                 attn_mask = attn_mask.bool() if attention_mask is not None else None
             # QK^T/sqrt(d_k),加了缩放因子sqrt(d_k)的注意力就是缩放点积注意力。
-            # 该方法是pytorch2.0中的官方实现，is_causal=True表示使用因果掩码，在分数的上三角部分设置为-inf
+            # 该方法是pytorch2.0中的官方实现：is_causal=True表示使用因果掩码，在分数的上三角部分设置为-inf，确保模型不能看到未来的信息
+            # attn_mask是一个可选的注意力掩码，True代表要屏蔽的位置，False代表要保留的位置
             output = F.scaled_dot_product_attention(xq, xk, xv, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=True)
         else: # 手动实现注意力分数 QK^T/sqrt(d_k)
             # @ 规定乘以最后两个维度，即矩阵乘法，前面的维度当做批次，进行并行计算
+            # scores:(bsz, n_local_heads, seq_len, seq_len)
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            # 进行mask
+            # 进行因果mask，确保模型只能看到当前及之前的token
             # triu() 取输入矩阵的上三角部分，diagonal=1 从主对角线(左上->右下)往上一斜线开始保留矩阵元素
             scores = scores + torch.triu(
-                torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
+                torch.full((seq_len, seq_len), float("-inf"), device=scores.device), # 这里好像没考虑使用kv cache的情况
                 diagonal=1
             ).unsqueeze(0).unsqueeze(0)  # scores+mask
-
+            # 使用填充掩码
+            # 填充mask会直接告诉模型每个位置是否需要参与注意力计算
             if attention_mask is not None:
-                extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+                # (bsz, seq_len) -> (bsz, 1, 1, seq_len) -> (bsz, n_local_heads, seq_len, seq_len)
+                extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2) # unsqueeze只是形状变了，并没有改变值
                 extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
                 scores = scores + extended_attention_mask
-
+            # softmax计算注意力权重
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             scores = self.attn_dropout(scores)
-            output = scores @ xv
+            # (bsz, seq_len, n_local_heads, head_dim)
+            output = scores @ xv # 最后乘Q_V矩阵
 
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
-        output = self.resid_dropout(self.o_proj(output))
+        # (bsz, seq_len, num_heads * head_dim) -> (bsz, seq_len, )
+        output = self.resid_dropout(self.o_proj(output)) # 残差连接前的dropout
         return output, past_kv
 
 
