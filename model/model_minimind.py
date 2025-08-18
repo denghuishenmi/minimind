@@ -23,7 +23,7 @@ class MiniMindConfig(PretrainedConfig):
             vocab_size: int = 6400,
             rms_norm_eps: float = 1e-05,
             rope_theta: int = 1000000.0,
-            flash_attn: bool = True,
+            flash_attn: bool = False,
             ####################################################
             # Here are the specific configurations of MOE
             # When use_moe is false, the following is invalid
@@ -185,7 +185,7 @@ class Attention(nn.Module):
         xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len]) # 动态匹配对应长度的位置编码
 
         # kv_cache实现
-        # 在这里如果使用kv cache的话，xk和xv的seq_len长度就会是当前seq_len+last_seq_len，后面手动实现sdpa时scores的计算会出问题
+        # 如果使用kv cache的话，xk和xv的seq_len长度就会是当前seq_len+last_seq_len，后面手动实现sdpa时scores的计算好像会出问题
         if past_key_value is not None:
             xk = torch.cat([past_key_value[0], xk], dim=1) # dim=1 是因为dim_1是seq_len维度，需要按照seq_len维度拼接
             xv = torch.cat([past_key_value[1], xv], dim=1)
@@ -197,7 +197,7 @@ class Attention(nn.Module):
             # (batch_size, seq_len, n_local_heads, head_dim) -> (batch_size, n_local_heads, seq_len, head_dim)
             xq.transpose(1, 2), 
             # 扩展k,v头数，使之与q头数匹配
-            # (batch_size, seq_len, n_local_kv_heads, head_dim) -> (batch_size, n_local_kv_heads, seq_len, head_dim)
+            # (batch_size, seq_len, n_local_kv_heads, head_dim) -> (batch_size, n_local_kv_heads*n_rep, seq_len, head_dim)
             repeat_kv(xk, self.n_rep).transpose(1, 2), 
             repeat_kv(xv, self.n_rep).transpose(1, 2)
         )
@@ -210,7 +210,7 @@ class Attention(nn.Module):
             if attention_mask is not None:
                 # 将注意力掩码扩展到多头注意力分数矩阵的维度 
                 # seq_len就是current_seq_len，last_seq_len是kv cache的长度，若没有就是0
-                # (bsz, seq) -> (bsz, 1, 1, seq) -> (bsz, n_local_heads, current_seq_len, current_seq_len+last_seq_len)
+                # (bsz, seq) -> (bsz, 1, 1, seq) -> (bsz, n_local_heads, seq_len, seq_len)
                 attn_mask = attention_mask.view(bsz, 1, 1, -1).expand(bsz, self.n_local_heads, seq_len, -1)
                 # 将注意力掩码转换为布尔类型，以便在后续的缩放点积注意力计算中使用
                 attn_mask = attn_mask.bool() if attention_mask is not None else None
@@ -238,15 +238,15 @@ class Attention(nn.Module):
             # softmax计算注意力权重
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             scores = self.attn_dropout(scores)
-            # (bsz, seq_len, n_local_heads, head_dim)
+            # (bsz, n_local_heads, seq_len, head_dim)
             output = scores @ xv # 最后乘Q_V矩阵
-
+        # (bsz, n_local_heads, seq_len, head_dim) -> (bsz, seq_len, n_local_heads * head_dim)
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
-        # (bsz, seq_len, num_heads * head_dim) -> (bsz, seq_len, )
+        # (bsz, seq_len, n_local_heads * head_dim) = (bsz, seq_len, hidden_size)
         output = self.resid_dropout(self.o_proj(output)) # 残差连接前的dropout
         return output, past_kv
 
-
+# 门控GLU:相比较传统的升降维FFD，多了一个可学习的门控层，在通过激活函数后可以决定升维后的信息如何通过
 class FeedForward(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
