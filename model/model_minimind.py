@@ -246,7 +246,7 @@ class Attention(nn.Module):
         output = self.resid_dropout(self.o_proj(output)) # 残差连接前的dropout
         return output, past_kv
 
-# 门控GLU:相比较传统的升降维FFD，多了一个可学习的门控层，在通过激活函数后可以决定升维后的信息如何通过
+# 门控GLU:相比较传统的升降维FFD，多了一个可学习的门控层，在通过激活函数后可以决定升维后的信息通过的概率
 class FeedForward(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
@@ -267,47 +267,69 @@ class MoEGate(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
         self.config = config
-        self.top_k = config.num_experts_per_tok
-        self.n_routed_experts = config.n_routed_experts
+        self.top_k = config.num_experts_per_tok # 每个token选择的专家数量
+        self.n_routed_experts = config.n_routed_experts # 可路由的专家总数
 
-        self.scoring_func = config.scoring_func
-        self.alpha = config.aux_loss_alpha
-        self.seq_aux = config.seq_aux
+        self.scoring_func = config.scoring_func # 打分函数 (当前仅支持softmax)
+        self.alpha = config.aux_loss_alpha # 辅助损失的权重系数
+        self.seq_aux = config.seq_aux # 辅助损失是否按序列级别计算
 
-        self.norm_topk_prob = config.norm_topk_prob
-        self.gating_dim = config.hidden_size
+        self.norm_topk_prob = config.norm_topk_prob # 是否对 top-k 权重归一化
+        self.gating_dim = config.hidden_size # 输入隐藏层的维度
+        # 门控权重矩阵 [n_experts, hidden_size]
         self.weight = nn.Parameter(torch.empty((self.n_routed_experts, self.gating_dim)))
         self.reset_parameters()
 
+    # 在层创建时初始化参数;如果不初始化，参数是全零或者全相同的，网络就没法学习
     def reset_parameters(self) -> None:
         import torch.nn.init as init
+        # kaiming初始化，专为ReLU激活函数设计;参数a为了兼容 LeakyReLU 这类带负斜率的激活函数
+        # 如果是普通 ReLU，就设 a=0。如果是 LeakyReLU(负斜率 = 1/√5)，那就用 a=√5
         init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
     def forward(self, hidden_states):
+        # (bsz, seq_len, hidden_size)
         bsz, seq_len, h = hidden_states.shape
+        # (bsz*seq_len, hidden_size)
         hidden_states = hidden_states.view(-1, h)
+        # 进行矩阵乘法 hidden_states@self.weight^T,不使用偏置项;
+        # (bsz*seq_len, hidden_size) * (hidden_size,n_routed_experts)->(bsz*seq_len,n_routed_experts)
         logits = F.linear(hidden_states, self.weight, None)
         if self.scoring_func == 'softmax':
-            scores = logits.softmax(dim=-1)
+            # (bsz*seq_len,n_routed_experts)
+            scores = logits.softmax(dim=-1) # 每个 token 对专家的概率分布
         else:
             raise NotImplementedError(f'insupportable scoring function for MoE gating: {self.scoring_func}')
-
+        # 在指定维度上选择评分的前k个元素：选择评分最高的前K个专家，即经过softmax以后评分高的；
+        # weight和idx形状相同，与scores只在最后一个维度上不同，值是top_k
+        # (bsz*seq_len,top_k)
         topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
-
+        # 如果选择多个专家可能需要权重归一化，保证其权重和为1
         if self.top_k > 1 and self.norm_topk_prob:
+            # keepdim:保持求和后维度数量不变；1e-20:添加一个极小值避免分母为零，例如权重全为零的情况
             denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
             topk_weight = topk_weight / denominator
 
+        # MoE存在部分专家经常被选择，而有的几乎不用，导致负载不均衡。因此需要引入辅助损失。
         if self.training and self.alpha > 0.0:
+            # (bsz*seq_len,n_routed_experts)
             scores_for_aux = scores
             aux_topk = self.top_k
-            topk_idx_for_aux_loss = topk_idx.view(bsz, -1)
+            # (bsz, seq_len*top_k)
+            topk_idx_for_aux_loss = topk_idx.view(bsz, -1) # 记录每个token的专家选择结果
+            # 辅助损失是否按照seq_len级别运算
             if self.seq_aux:
+                # (bsz, seq_len, n_routed_experts)
                 scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
+                # (bsz, n_routed_experts),用来记录每个batch内token分配到专家的次数，例如[[1,0,1,0]]就代表第一个batch内，前四个token分配到的专家次数
                 ce = torch.zeros(bsz, self.n_routed_experts, device=hidden_states.device)
+                # scatter_add_:分布式加法操作，统计每个专家被选择的次数。
+                #              在 dim=1（专家维度）上，根据 topk_idx_for_aux_loss（每个 token 选出的专家编号），把 1 累加到对应专家
+                # div_:归一化计数，相当于计算实际使用次数 / 理论平均次数。
                 ce.scatter_add_(1, topk_idx_for_aux_loss,
                                 torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device)).div_(
                     seq_len * aux_topk / self.n_routed_experts)
+                # 计算每个 batch 的 token 在专家上的分数取平均,然后乘每个专家的使用次数ce，再对专家求和，再取平均，并做一个系数，从而得到aux_loss
                 aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha
             else:
                 mask_ce = F.one_hot(topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts)
