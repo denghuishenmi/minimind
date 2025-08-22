@@ -317,7 +317,8 @@ class MoEGate(nn.Module):
             aux_topk = self.top_k
             # (bsz, seq_len*top_k)
             topk_idx_for_aux_loss = topk_idx.view(bsz, -1) # 记录每个token的专家选择结果
-            # 辅助损失是否按照seq_len级别运算
+            # 辅助损失是否按照seq_len级别运算，每个样本(batch)独立算一个专家负载均衡情况，再对 batch 平均
+            # 确保每个样本内部 token 的专家使用是均衡的，避免出现某个样本内所有 token 都被路由到同一个专家
             if self.seq_aux:
                 # (bsz, seq_len, n_routed_experts)
                 scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
@@ -331,10 +332,14 @@ class MoEGate(nn.Module):
                     seq_len * aux_topk / self.n_routed_experts)
                 # 计算每个 batch 的 token 在专家上的分数取平均,然后乘每个专家的使用次数ce，再对专家求和，再取平均，并做一个系数，从而得到aux_loss
                 aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha
-            else:
+            else: # 在所有batch下对专家的计算，可能会出现某些专家一直使用，某些一直没有使用，但是整体平均下来是均衡的
+                # 把所有token选择的专家转为one-hot向量 (bsz*seq_len*top_k, n_routed_experts)
                 mask_ce = F.one_hot(topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts)
+                # 对所有 token 的选择结果取平均 → 得到每个专家被选中的概率，表示实际专家的使用分布
                 ce = mask_ce.float().mean(0)
+                # 表示 gating 预测的专家分布
                 Pi = scores_for_aux.mean(0)
+                # 乘上专家数量，得到实际使用的专家分布
                 fi = ce * self.n_routed_experts
                 aux_loss = (Pi * fi).sum() * self.alpha
         else:
