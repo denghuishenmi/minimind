@@ -311,6 +311,7 @@ class MoEGate(nn.Module):
             topk_weight = topk_weight / denominator
 
         # MoE存在部分专家经常被选择，而有的几乎不用，导致负载不均衡。因此需要引入辅助损失。
+        # 如果是训练状态并且alpha>0
         if self.training and self.alpha > 0.0:
             # (bsz*seq_len,n_routed_experts)
             scores_for_aux = scores
@@ -341,8 +342,9 @@ class MoEGate(nn.Module):
                 Pi = scores_for_aux.mean(0)
                 # 乘上专家数量，得到实际使用的专家分布
                 fi = ce * self.n_routed_experts
+                # 两个分布(向量)的点积越大，代表着两个分布越相似
                 aux_loss = (Pi * fi).sum() * self.alpha
-        else:
+        else: # 推理状态下不使用辅助损失
             aux_loss = 0
         return topk_idx, topk_weight, aux_loss
 
@@ -363,13 +365,17 @@ class MOEFeedForward(nn.Module):
             ])
 
     def forward(self, x):
+        # 保留原始输入、形状
         identity = x
         orig_shape = x.shape
         bsz, seq_len, _ = x.shape
-        # 使用门控机制选择专家
+        # 使用门控机制对每个 token 选择 前 k 个专家，并输出权重（概率），平衡损失
         topk_idx, topk_weight, aux_loss = self.gate(x)
+        # (bsz, seq_len, hidden)
         x = x.view(-1, x.shape[-1])
+        # 把专家索引拉平成一维数组，方便后面按专家分组
         flat_topk_idx = topk_idx.view(-1)
+        # 如果是训练阶段
         if self.training:
             x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)
             y = torch.empty_like(x, dtype=torch.float16)
