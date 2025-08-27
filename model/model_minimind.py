@@ -301,8 +301,9 @@ class MoEGate(nn.Module):
         else:
             raise NotImplementedError(f'insupportable scoring function for MoE gating: {self.scoring_func}')
         # 在指定维度上选择评分的前k个元素：选择评分最高的前K个专家，即经过softmax以后评分高的；
-        # weight和idx形状相同，与scores只在最后一个维度上不同，值是top_k
-        # (bsz*seq_len,top_k)
+        # weight和idx形状相同，与scores只在最后一个维度上不同，都是(bsz*seq_len,top_k)
+        # weight的值是scores的值，idx的值是scores的索引，例如scores=[[0.1,0.2,0.3,0.4],[0.5,0.2,0.3,0.4]]
+        # 那么topk_weight=[[0.4,0.3],[0.5,0.4]]，topk_idx=[[3,2],[0,3]]
         topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
         # 如果选择多个专家可能需要权重归一化，保证其权重和为1
         if self.top_k > 1 and self.norm_topk_prob:
@@ -346,6 +347,7 @@ class MoEGate(nn.Module):
                 aux_loss = (Pi * fi).sum() * self.alpha
         else: # 推理状态下不使用辅助损失
             aux_loss = 0
+        # (bsz*seq_len,top_k),(bsz*seq_len,top_k)
         return topk_idx, topk_weight, aux_loss
 
 
@@ -369,24 +371,37 @@ class MOEFeedForward(nn.Module):
         identity = x
         orig_shape = x.shape
         bsz, seq_len, _ = x.shape
-        # 使用门控机制对每个 token 选择 前 k 个专家，并输出权重（概率），平衡损失
+        # 使用门控机制对每个 token 选择前 k 个专家，并输出权重（概率），平衡损失
+        # (bsz*seq_len,top_k)
         topk_idx, topk_weight, aux_loss = self.gate(x)
-        # (bsz, seq_len, hidden)
+        # (bsz*seq_len, hidden)
         x = x.view(-1, x.shape[-1])
         # 把专家索引拉平成一维数组，方便后面按专家分组
+        # (bsz*seq_len*top_k)
         flat_topk_idx = topk_idx.view(-1)
         # 如果是训练阶段
         if self.training:
+            # 复制输入，每个token在第dim维度上重复num_experts_per_tok次，例如
+            # [[1,2],[3,4]]->在第0维重复两次->[[1,2],[1,2],[3,4],[3,4]]
+            # (bsz*seq_len, hidden)->(bsz*seq_len*num_experts_per_tok, hidden)
             x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)
+            # 创建一个与输入x形状相同的空张量y，用于存储专家处理后的结果
+            # (bsz*seq_len*num_experts_per_tok, hidden)
             y = torch.empty_like(x, dtype=torch.float16)
             for i, expert in enumerate(self.experts):
+                # 遍历专家，按照索引flat_topk_idx找到对应专家处理的token，将其放到y中对应位置存储
                 y[flat_topk_idx == i] = expert(x[flat_topk_idx == i]).to(y.dtype)  # 确保类型一致
+            # 把多个专家的结果按照权重加权平均;sum会直接在形状上压缩掉一维
+            # (bsz*seq_len,top_k,hidden) * (bsz*seq_len,top_k,1) -> (bsz*seq_len,hidden)
             y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
+            # (bsz,seq_len,hidden)
             y = y.view(*orig_shape)
-        else:
+        else: # 推理阶段
             y = self.moe_infer(x, flat_topk_idx, topk_weight.view(-1, 1)).view(*orig_shape)
         if self.config.n_shared_experts > 0:
+            # share expert是一个兜底性的专家，保证所有 token 至少能走一条稳定路径
             for expert in self.shared_experts:
+                # 当经过route expert以后，再加上shared_experts的输出，强制把通用专家的输出融合进去
                 y = y + expert(identity)
         self.aux_loss = aux_loss
         return y
