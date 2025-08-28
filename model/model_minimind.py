@@ -246,7 +246,8 @@ class Attention(nn.Module):
         output = self.resid_dropout(self.o_proj(output)) # 残差连接前的dropout
         return output, past_kv
 
-# 门控GLU:相比较传统的升降维FFD，多了一个可学习的门控层，在通过激活函数后可以决定升维后的信息通过的概率
+# 专家网络：独立的子网络，通常是一个前馈神经网络FFN或者MLP
+# 门控GLU:相比较传统的升降维FFN，多了一个可学习的门控层gate_proj，在通过激活函数后可以决定升维后的信息通过的概率
 class FeedForward(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
@@ -297,13 +298,13 @@ class MoEGate(nn.Module):
         logits = F.linear(hidden_states, self.weight, None)
         if self.scoring_func == 'softmax':
             # (bsz*seq_len,n_routed_experts)
-            scores = logits.softmax(dim=-1) # 每个 token 对专家的概率分布
+            scores = logits.softmax(dim=-1) # scores是每个token(bsz*seq_len)对专家(n_routed_experts)的概率分布
         else:
             raise NotImplementedError(f'insupportable scoring function for MoE gating: {self.scoring_func}')
         # 在指定维度上选择评分的前k个元素：选择评分最高的前K个专家，即经过softmax以后评分高的；
         # weight和idx形状相同，与scores只在最后一个维度上不同，都是(bsz*seq_len,top_k)
         # weight的值是scores的值，idx的值是scores的索引，例如scores=[[0.1,0.2,0.3,0.4],[0.5,0.2,0.3,0.4]]
-        # 那么topk_weight=[[0.4,0.3],[0.5,0.4]]，topk_idx=[[3,2],[0,3]]
+        # 那么topk_weight=[[0.4,0.3],[0.5,0.4]],代表专家概率，topk_idx=[[3,2],[0,3]],代表专家索引号
         topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
         # 如果选择多个专家可能需要权重归一化，保证其权重和为1
         if self.top_k > 1 and self.norm_topk_prob:
@@ -350,7 +351,7 @@ class MoEGate(nn.Module):
         # (bsz*seq_len,top_k),(bsz*seq_len,top_k)
         return topk_idx, topk_weight, aux_loss
 
-
+# 混合专家网络(MOE)
 class MOEFeedForward(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
@@ -371,13 +372,13 @@ class MOEFeedForward(nn.Module):
         identity = x
         orig_shape = x.shape
         bsz, seq_len, _ = x.shape
-        # 使用门控机制对每个 token 选择前 k 个专家，并输出权重（概率），平衡损失
-        # (bsz*seq_len,top_k)
+        # 使用门控机制对每个 token 选择前 k 个专家，并输出专家的索引、选在该专家的概率(score)，平衡损失
+        # (bsz*seq_len,top_k) bsz*seq_len代表token数，top_k代表专家的索引/得分，例如(3,2)，那么topk_idx[[2,0],[2,0],[2,0]]的意思是token0用了2,0两个专家，token1...以此类推
         topk_idx, topk_weight, aux_loss = self.gate(x)
         # (bsz*seq_len, hidden)
         x = x.view(-1, x.shape[-1])
         # 把专家索引拉平成一维数组，方便后面按专家分组
-        # (bsz*seq_len*top_k)
+        # (bsz*seq_len*top_k) [[2,0],[2,0],[2,0]] -> [2,0,2,0,2,0]
         flat_topk_idx = topk_idx.view(-1)
         # 如果是训练阶段
         if self.training:
@@ -408,23 +409,38 @@ class MOEFeedForward(nn.Module):
 
     @torch.no_grad()
     def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
+        # x:(bsz*seq_len, hidden) flat_expert_indices:(bsz*seq_len*top_k) flat_expert_weights:(bsz*seq_len*top_k,1)
+        # 用于累加专家对token的贡献 (bsz*seq_len, hidden)
         expert_cache = torch.zeros_like(x)
+        # 对展平的专家索引进行排序，得到排序后的索引所对应的数组下标 (bsz*seq_len*top_k)
         idxs = flat_expert_indices.argsort()
+        # bincount() 得到长度为 n_routed_experts 的数组，统计每个专家在 flat_expert_indices 中出现的次数
+        # 例如 torch.bincount(tensor([0, 0, 1, 2, 1, 3, 0, 2])) -> tensor([3, 2, 2, 1])
+        # cumsum() 把计数转换为“累积结束索引”数组，便于用 idxs 做切片。转cpu再转numpy,使用numpy的cumsum处理(其实torch也有cumsum)
+        # 例如 counts [3,5,2] => cumsum [3,8,10]，表示专家0条目在 idxs[:3]，专家1在 idxs[3:8]，专家2在 idxs[8:10]
         tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
+        # 由于idxs是展平后的专家索引，即(bsz*seq_len,top_k)->(bsz*seq_len*top_k),那么整除top_k就能还原回专家所对应的token
+        # 例如topk_idx是[[2,0],[2,0],[2,0]]，代表有3个token，且每个token都是2号与0号专家
+        # 展平得[2,0,2,0,2,0],排序得idxs[1,3,5,4,2,0]，
+        # 整除top_k(专家数)得 token_idxs[0,1,2,2,1,0],
+        # 即idxs=1是token0的专家，idxs=3是token1的专家，idxs=5是token2的专家，idxs=4是token2的专家
         token_idxs = idxs // self.config.num_experts_per_tok
         # 当tokens_per_expert = [6, 15, 20, 26]，tokens_per_expert.shape[0]即为专家数量（此时为4）
         # 且token_idxs = [3, 7, 19, 21, 24, 25,  4,  5,  6, 10, 11, 12...] 时
         # 意味token_idxs[:6] -> [3, 7, 19, 21, 24, 25]这6个位置属于专家0处理的token（每个token有可能被多个专家处理，这取决于num_experts_per_tok）
         # 接下来9个位置token_idxs[6:15] -> [4,  5,  6, 10, 11, 12...]属于专家1处理的token...依此类推
-        for i, end_idx in enumerate(tokens_per_expert):
-            start_idx = 0 if i == 0 else tokens_per_expert[i - 1]
+        for i, end_idx in enumerate(tokens_per_expert): # 按照专家分批处理
+            start_idx = 0 if i == 0 else tokens_per_expert[i - 1] # i ≠ 0, start_idx = 上一个专家的结束索引
             if start_idx == end_idx:
                 continue
             expert = self.experts[i]
             exp_token_idx = token_idxs[start_idx:end_idx]
-            expert_tokens = x[exp_token_idx]
+            expert_tokens = x[exp_token_idx] # 取出x中索引为exp_token_idx的token，交给指定的专家去计算
+            # 对token进行专家计算(FFN)
             expert_out = expert(expert_tokens).to(expert_cache.dtype)
+            # 从排序后的idxs中取出对应位置的专家索引，然后按照索引取出对专家的打分，在原地与expert_out进行逐元素相乘(.mul_)，并保存在expert_out中
             expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])
+            # 将经过专家计算的expert_out值，在dim维度上，加到expert_cache的指定位置上
             expert_cache.scatter_add_(0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out)
 
         return expert_cache
