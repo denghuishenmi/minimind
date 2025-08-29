@@ -100,9 +100,9 @@ the entire process of building a language model from 0 to 1. Let's enjoy the fun
 
 | Model (Size)            | Inference Usage (Approx.) | Release    | 
 |-------------------------|---------------------------|------------|
-| MiniMind2-small (26M)   | 0.5 GB                    | 2025.04.26 |
-| MiniMind2-MoE (145M)    | 1.0 GB                    | 2025.04.26 |
-| MiniMind2 (104M)        | 1.0 GB                    | 2025.04.26 |
+| MiniMind2-small (26M)   | 0.5 GB                    | 2025.02.06 |
+| MiniMind2-MoE (145M)    | 1.0 GB                    | 2025.02.06 |
+| MiniMind2 (104M)        | 1.0 GB                    | 2025.02.06 |
 | minimind-v1-small (26M) | 0.5 GB                    | 2024.08.28 |
 | minimind-v1-moe (4×26M) | 1.0 GB                    | 2024.09.17 |
 | minimind-v1 (108M)      | 1.0 GB                    | 2024.09.01 |
@@ -123,7 +123,6 @@ the entire process of building a language model from 0 to 1. Let's enjoy the fun
 - Model testing on third-party evaluation benchmarks (C-Eval, C-MMLU, OpenBookQA, etc.).
 - A minimal server implementing the Openai-Api protocol, easy to integrate into third-party ChatUI applications (
   FastGPT, Open-WebUI, etc.).
-- Fully compatible with popular community inference engines like llama.cpp, vllm, ollama, or training frameworks such as Llama-Factory.
 - A simple chat WebUI front-end implemented using streamlit.
 - Reproduction (distillation/RL) of the large inference model DeepSeek-R1 as the MiniMind-Reason model, **data + model**
   all open-source!
@@ -132,36 +131,8 @@ We hope this open-source project can help LLM beginners quickly get started!
 
 ### 👉**Update log**
 
-<details close>  
-<summary> <b>2025-04-26 (newest 🎉🎉🎉)</b> </summary>  
-
-• Major Updates  
-
-• For compatibility needs, visit [🔗Legacy Repository Content🔗](https://github.com/jingyaogong/minimind/tree/7da201a944a90ed49daef8a0265c959288dff83a).  
-
-• MiniMind model parameters have been fully renamed to align with Transformers library models (unified naming).  
-
-• The `generate` method has been refactored, now inheriting from the `GenerationMixin` class.  
-
-• 🔥 Support for popular third-party ecosystems like llama.cpp, vllm, and ollama.  
-
-• Standardized code and directory structure.   
-
-• Updated vocabulary tokens: `<s></s>` → `<|im_start|><|im_end|>`.  
-
-
-```text  
-To ensure compatibility with third-party inference frameworks (llama.cpp, vllm), this update comes at a non-trivial cost.  
-Models saved before 2025-04-26 can no longer be **directly** loaded for inference.  
-Due to differences in positional encoding between Llama and MiniMind, QK values diverge after weight mapping.  
-MiniMind2 legacy models have been restored via weight mapping + (fine-tuning) QKVO linear layer calibration.  
-After this update, maintenance for the entire `minimind-v1` series will be discontinued, and the models will be removed from the repository.  
-```  
-</details>  
-
-
 <details close> 
-<summary> <b>2025-02-09</b> </summary>
+<summary> <b>2025-02-09 (newest 🎉🎉🎉)</b> </summary>
 
 - Major update since the release, with the release of MiniMind2 Series.
 - Almost all code has been refactored, using a more streamlined and unified structure.
@@ -250,42 +221,27 @@ git clone https://github.com/jingyaogong/minimind.git
 
 ## Ⅰ Test Pre-trained Model
 
-
-### 1. Environment Setup
-
-```bash
-pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
-```
-
-
-### 2. Download the Model
+### 1. Download the Model
 
 ```bash
+# step 1
 git clone https://huggingface.co/jingyaogong/MiniMind2
 ```
 
-### (Optional) Command-line Q&A
+### 2. Command-line Q&A
 
 ```bash
-# load=0: load from pytorch model, load=1: load from transformers-hf model
-python eval_model.py --load 1 --model_mode 2
+# step 2
+# load=1: load from transformers-hf model
+python eval_model.py --load 1
 ```
 
-### (Optional) Launch WebUI
+### 3. Or Start WebUI
 
 ```bash
-# May require `python>=3.10`, install with `pip install streamlit`
+# You may need `python>=3.10` and install `pip install streamlit`.
 # cd scripts
 streamlit run web_demo.py
-```
-
-### (Optional) Third-party inference frameworks
-
-```bash
-# ollama
-ollama run jingyaogong/minimind2
-# vllm
-vllm serve ./MiniMind2/ --served-model-name "minimind"
 ```
 
 ## Ⅱ Training from Scratch
@@ -314,8 +270,8 @@ for guidance.
 ### 2. Data Download
 
 Download the required data files from
-the [dataset download link](https://www.modelscope.cn/datasets/gongjy/minimind_dataset/files) 
-(please `mkdir dataset`) and place them in the `./dataset` directory.
+the [dataset download link](https://www.modelscope.cn/datasets/gongjy/minimind_dataset/files) and place them in
+the `./dataset` directory.
 
 <details style="color:rgb(128,128,128)">
 <summary>Note: Dataset Information</summary>
@@ -329,8 +285,6 @@ needs and GPU resources.
 </details>
 
 ### 3. Start Training
-
-The directory is located at `trainer`
 
 **3.1 Pretraining (Learning Knowledge)**
 
@@ -393,30 +347,27 @@ SFT-Chat model, 2: RLHF-Chat model, 3: Reason model.
 Start training with N GPUs on a single machine (DDP, supports multi-node, multi-GPU clusters):
 
 ```bash
-torchrun --nproc_per_node N train_xxx.py
+torchrun --nproc_per_node 3 train_xxx.py
 ```
 
 <details style="color:rgb(128,128,128)">
 <summary>Note: Others</summary>
 
-Start training with N GPUs on a single machine (DeepSpeed):
+* Start training with N GPUs on a single machine (DeepSpeed):
+  ```bash
+  deepspeed --master_port 29500 --num_gpus=N train_xxx.py
+  ```
 
-```bash
-deepspeed --master_port 29500 --num_gpus=N train_xxx.py
-```
-
-Enable wandb to record the training process if needed:
-
-```bash
-# Need to log in: wandb login
-torchrun --nproc_per_node N train_xxx.py --use_wandb
-# and
-python train_xxx.py --use_wandb
-```
-
-By adding the `--use_wandb` parameter, the training process will be recorded, and after training, you can view the
-process on the wandb website. Modify the `wandb_project` and `wandb_run_name` parameters to specify project and run
-names.
+* Enable wandb to record the training process if needed:
+    ```bash
+    # Need to log in: wandb login
+    torchrun --nproc_per_node N train_xxx.py --use_wandb
+    # and
+    python train_xxx.py --use_wandb
+    ```
+  By adding the `--use_wandb` parameter, the training process will be recorded, and after training, you can view the
+  process on the wandb website. Modify the `wandb_project` and `wandb_run_name` parameters to specify project and run
+  names.
 
 </details>
 
@@ -557,14 +508,15 @@ Big respect!
 
 ---
 
-## Ⅷ MiniMind Dataset Download
+## Ⅷ Dataset Download
 
 > [!NOTE]
 > After `2025-02-05`, MiniMind’s open-source datasets for final training are provided, so there is no need for
 > you to preprocess large datasets by yourself anymore. This helps avoid redundant work.
 
-Available for download from:
-[ModelScope](https://www.modelscope.cn/datasets/gongjy/minimind_dataset/files) | [HuggingFace](https://huggingface.co/datasets/jingyaogong/minimind_dataset/tree/main)
+MiniMind Training Datasets are available for download from:
+
+Dataset ([ModelScope](https://www.modelscope.cn/datasets/gongjy/minimind_dataset/files) | [HuggingFace](https://huggingface.co/datasets/jingyaogong/minimind_dataset/tree/main))
 
 > You don’t need to clone everything, just download the necessary files.
 
@@ -735,8 +687,6 @@ download and test the model's performance.
 
 ## Ⅱ Main Training Steps
 
-> All training scripts are executed in the `cd ./trainer` directory.
-
 ### **1. Pretraining**:
 
 The first task for LLM is not to interact directly with humans, but to fill the network parameters with knowledge. The "
@@ -784,8 +734,6 @@ python train_full_sft.py
 > model dimension, and each new save will overwrite the previous one).
 
 ## Ⅲ Other Training Steps
-
-> All training scripts are executed in the `cd ./trainer` directory.
 
 ### **3. Reinforcement Learning from Human Feedback (RLHF)**
 
@@ -1348,6 +1296,7 @@ scores:
 | 7    | E     | 22                   | 23                       | 15                | 14                       | 74                 |
 | 8    | G     | 10                   | 12                       | 10                | 10                       | 42                 |
 
+---
 
 ### 👉 Subjective Effect Summary
 
@@ -1359,8 +1308,6 @@ My personal evaluation aligns with DeepSeek-R1's results，and：
 * Model G may have incomplete training data, and the performance based on tested weights is poor.
 * Repeating the timeless Scaling Law: The larger the parameters and the more training data, the stronger the model's
   performance.
-
----
 
 ## Ⅲ Objective Benchmark
 
@@ -1404,13 +1351,16 @@ is mainly for fun, so take the results lightly:
 
 # 📌 Others
 
-## Model Conversion
+### Inference and Export
 
-* [./scripts/convert_model.py](./scripts/convert_model.py) can be used to convert between `torch models` and `transformers` models.
+* [./scripts/convert_model.py](./scripts/convert_model.py) can convert models between torch/transformers.
+
+* MiniMind's HuggingFace collection link:
+  [MiniMind](https://huggingface.co/collections/jingyaogong/minimind-66caf8d999f5c7fa64f399e5)
 
 ---
 
-## Based on MiniMind-API Service Interface
+### Based on MiniMind-API Service Interface
 
 * [./scripts/serve_openai_api.py](./scripts/serve_openai_api.py) provides the simplest chat interface compatible with
   the OpenAI API,
@@ -1455,73 +1405,6 @@ is mainly for fun, so take the results lightly:
     }'
     ```
 
-## VLLM Model Inference (Service)
-
-[vLLM](https://github.com/vllm-project/vllm) is an extremely popular and efficient inference framework that supports fast deployment of large models, optimizing memory utilization and throughput.
-
-```bash
-vllm serve ./MiniMind2/ --model-impl transformers --served-model-name "minimind"
-```
-
-The service will start using the OpenAI API protocol, with the default port being 8000.
-
-For more usage, please refer to the official documentation.
-
-## llama.cpp
-[llama.cpp](https://github.com/ggerganov/llama.cpp) is a C++ library that can be used directly from the command line, supporting multi-threaded inference and GPU acceleration.
-
-After installation (refer to the official repository), insert the following code at line 760 of `convert_hf_to_gguf.py`:
-```text
-# Add MiniMind2 tokenizer support
-if res is None:
-    res = "smollm"
-```
-
-Convert a custom-trained MiniMind model to gguf:
-```bash
-python convert_hf_to_gguf.py ../minimind/MiniMind2/
-```
-
-Quantize the model:
-```bash
-./build/bin/llama-quantize ../minimind/MiniMind2/MiniMind2-109M-F16.gguf ../minimind/MiniMind2/Q4-MiniMind2.gguf Q4_K_M
-```
-
-Command line inference:
-```bash
-./build/bin/llama-cli -m ../minimind/MiniMind2/MiniMind2-109M-F16.gguf --chat-template chatml
-```
-
-For more usage, please refer to the official documentation.
-
-## ollama
-
-[ollama](https://ollama.ai/) is a tool for running large models locally, supporting multiple open-source LLMs, and is easy to use.
-
-To load a custom gguf model with ollama, create a new file `minimind.modelfile`:
-```text
-FROM ./MiniMind2-109M-F16.gguf
-TEMPLATE """{{ if .System }}<|im_start|>system
-{{ .System }}<|im_end|>
-{{ end }}{{ if .Prompt }}<|im_start|>user
-{{ .Prompt }}<|im_end|>
-{{ end }}<|im_start|>assistant
-"""
-```
-
-Load the model and name it `minimind2`:
-```bash
-ollama create -f minimind.modelfile minimind2
-```
-
-Start inference:
-```text
-ollama run minimind2
-> Hello, I am MiniMind2, based on xxxxxxxx
-```
-
-For more usage, please refer to the official documentation.
-
 # 📌 Acknowledge
 
 > [!NOTE]
@@ -1563,9 +1446,6 @@ For more usage, please refer to the official documentation.
 
 <a href="https://github.com/RyanSunn"><b>@RyanSunn</b></a>:
 <a href="https://github.com/jingyaogong/minimind/issues/75">🔗Inference process learning record</a>
-
-<a href="https://github.com/Nijikadesu"><b>@Nijikadesu</b></a>:
-<a href="https://github.com/jingyaogong/minimind/issues/213">🔗Decompose project code in an interactive notebook format</a>
 
 <details close> 
 <summary> <b>Reference Links & Thanks to the following excellent papers or projects</b> </summary>
