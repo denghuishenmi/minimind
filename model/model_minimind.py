@@ -460,12 +460,14 @@ class MiniMindBlock(nn.Module):
         self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
 
     def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
-        residual = hidden_states
+        residual = hidden_states # 保存一份数据方便后面做残差连接
+        # 先对输入做一个RMSNorm归一化，然后传入自注意力层
         hidden_states, present_key_value = self.self_attn(
             self.input_layernorm(hidden_states), position_embeddings,
             past_key_value, use_cache, attention_mask
         )
-        hidden_states += residual
+        hidden_states += residual # 残差连接
+        # 再对输出做一个RMSNorm归一化，然后传入FFN层，FFN可以是传统FFN(可以引入非线性)或者MOE层
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
         return hidden_states, present_key_value
 
